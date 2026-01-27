@@ -1,3 +1,63 @@
+# Fast-FTIC
+
+This is a fast implementation of Frequency aware Transformer for Learned Image Compression (ICLR 2024). The original implementation is based on range-coder (slower than rANS) and 
+inefficient per-pixel cdf computation. This implementation uses rANS and batch cdf computation for faster evaluation.
+
+# Exactness
+
+This implementation is fully compatible with original weights. 
+The speed is much faster (less than 1s/img) than the original one while performance is a bit lower (approx. +0.001 bpp) due to the approximation in rANS.
+
+The RD curve is below:
+
+![](assets/kodak_rd_curves.png)
+
+### RD Data
+
+| Checkpoint | Forward (bpp / PSNR) | Compress (official RD) (bpp / PSNR) | Compress (This repo) (bpp / PSNR) |
+| --- | --- | --- | --- |
+| ckpt_0018.pth | 0.131 / 29.641 | 0.1294 / 29.640 | 0.132 / 29.641 |
+| ckpt_0035.pth | 0.198 / 31.143 | 0.2003 / 31.132 | 0.200 / 31.143 |
+| ckpt_0067.pth | 0.298 / 32.690 | 0.2993 / 32.702 | 0.300 / 32.690 |
+| ckpt_0130.pth | 0.437 / 34.413 | 0.4372 / 34.420 | 0.439 / 34.413 |
+| ckpt_0250.pth | 0.614 / 36.156 | 0.6158 / 36.170 | 0.616 / 36.156 |
+| ckpt_0483.pth | 0.839 / 37.904 | 0.8420 / 37.918 | 0.843 / 37.904 |
+
+### Runtime
+
+Runtime is evaluated with single RTX 5060 Ti. 
+
+| Checkpoint | Forward avg_time_s | Compress (This repo) avg_time_s |
+| --- | --- | --- |
+| ckpt_0018.pth | 0.237 | 0.655 |
+| ckpt_0035.pth | 0.176 | 0.606 |
+| ckpt_0067.pth | 0.219 | 0.612 |
+| ckpt_0130.pth | 0.217 | 0.759 |
+| ckpt_0250.pth | 0.22 | 0.806 |
+| ckpt_0483.pth | 0.211 | 1.072 |
+
+## Installation
+
+This implementation requires a custom rANS written in C++. Please follow the instructions below to compile it.
+
+```bash
+git clone https://github.com/tokkiwa/Fast-FTIC
+cd Fast-FTIC
+python3 -m pip install -e ./cpp --no-build-isolation
+```
+
+The model `models/flic.py` has newly added `compress_fast` and `decompress_fast` functions that utilize the custom rANS for faster compression and decompression. The other parts are mostly unchanged.
+
+Run the evaluation as follows:
+
+```bash
+python3 eval.py \
+  --checkpoint [path of the pretrained checkpoint] \
+  --data [path of testing dataset] --cuda --real --fast
+```
+
+The below are original README from FTIC. 
+
 # ICLR2024-Frequency-aware-Transformer-for-Learned-Image-Compression
 
 ## News

@@ -8,11 +8,11 @@ from compressai.layers import (
 )
 import os
 from compressai.ops import LowerBound
-from range_coder import RangeEncoder, RangeDecoder
 import numpy as np
 import torch.nn as nn
 from torch import Tensor
 import torch
+import ftic_rans as ans
 
 from einops import rearrange 
 from einops.layers.torch import Rearrange
@@ -20,11 +20,6 @@ from .entropy_models import GsnConditionalLocScaleShift
 from .tca import TCA_EntropyModel
 from timm.models.layers import  DropPath
 import math
-
-
-SCALES_MIN = 0.11
-SCALES_MAX = 256
-SCALES_LEVELS = 64
 def img2windows(img, H_sp, W_sp):
     """
     Input: Image (B, C, H, W)
@@ -50,6 +45,41 @@ def windows2img(img_splits_hw, H_sp, W_sp, H, W):
 
 def ste_round(x: Tensor) -> Tensor:
     return torch.round(x) - x.detach() + x
+
+
+def _build_cdf_gpu(means: Tensor, scales: Tensor, minmax: int, chunk: int = 8192) -> Tensor:
+    # Build per-symbol CDFs on GPU in chunks to limit memory usage.
+    device = means.device
+    means_f = means.to(dtype=torch.float32).flatten()
+    scales_f = scales.to(dtype=torch.float32).flatten().clamp_(min=0.01)
+    n = means_f.numel()
+    S = int(minmax) * 2 + 1
+    samples = torch.arange(S, device=device, dtype=torch.float32).view(1, S)
+    const = -1.0 / math.sqrt(2.0)
+    min_prob = 1.0 / 65536.0
+
+    cdfs = torch.empty((n, S + 1), device=device, dtype=torch.int32)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        mu = means_f[start:end].unsqueeze(1) + float(minmax)
+        sc = scales_f[start:end].unsqueeze(1)
+        values = torch.abs(samples - mu)
+        upper = 0.5 * torch.erfc(const * ((0.5 - values) / sc))
+        lower = 0.5 * torch.erfc(const * ((-0.5 - values) / sc))
+        pmf = upper - lower
+        pmf = torch.clamp(pmf, min=min_prob)
+        pmf_sum = pmf.sum(dim=1, keepdim=True)
+        pmf_q = torch.round(pmf / pmf_sum * 65536.0)
+        pmf_q = torch.clamp(pmf_q, min=1).to(torch.int32)
+        diff = 65536 - pmf_q.sum(dim=1, keepdim=True)
+        max_idx = pmf_q.argmax(dim=1, keepdim=True)
+        pmf_q.scatter_add_(1, max_idx, diff.to(pmf_q.dtype))
+
+        cdf = torch.cumsum(pmf_q, dim=1)
+        cdfs[start:end, 0] = 0
+        cdfs[start:end, 1:] = cdf
+
+    return cdfs
 
 
 
@@ -437,7 +467,6 @@ class FrequencyAwareTransFormer(CompressionModel):
     
     def forward(self, x):
         y = self.g_a(x)
-        y_shape = y.shape[2:]
         z = self.h_a(y)
         _, z_likelihoods = self.entropy_bottleneck(z)
 
@@ -582,4 +611,96 @@ class FrequencyAwareTransFormer(CompressionModel):
         y_hat= y_hat_coded+lrp_coded
         x_hat = self.g_s(y_hat).clamp_(0, 1)
 
+        return {"x_hat": x_hat}
+    def compress_fast(self, x):
+        cdf_chunk = int(os.environ.get("FTIC_CDF_CHUNK", "8192"))
+
+        y = self.g_a(x)
+
+        z = self.h_a(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+
+        latent_scales = self.h_scale_s(z_hat)
+        latent_means = self.h_mean_s(z_hat)
+        hyper = torch.cat((latent_means, latent_scales), dim=1)
+
+        y_hat_coded = torch.zeros_like(y)
+        channel_per_slices = self.M // self.num_slices
+        y_strings = []
+        minmaxs = []
+
+        for slice_index in range(self.num_slices):
+            means, scales, _ = self.tca(hyper, y_hat_coded)
+            mu = means[:, slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices]
+            scale = scales[:, slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices]
+            y_slice = y[:, slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices]
+            y_hat_slice = torch.round(y_slice)
+
+            slice_minmax = np.maximum(
+                abs(y_hat_slice.cpu()).max(), abs(y_hat_slice.cpu()).min()
+            )
+            slice_minmax = int(np.maximum(slice_minmax, 1))
+            symbols = (
+                (y_hat_slice + slice_minmax)
+                .to(dtype=torch.int32, device="cpu")
+                .flatten()
+                .contiguous()
+            )
+            cdfs = _build_cdf_gpu(mu, scale, slice_minmax, chunk=cdf_chunk)
+            cdfs_cpu = cdfs.to(dtype=torch.int32, device="cpu").contiguous()
+            y_string = ans.encode_with_cdfs_tensor(symbols, cdfs_cpu)
+            y_strings.append(y_string)
+            minmaxs.append(slice_minmax)
+
+            y_hat_coded[
+                :,
+                slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices,
+            ] = y_hat_slice
+        return {
+            "z_strings": z_strings,
+            "z_shape": z.size()[-2:],
+            "y_strings": y_strings,
+            "minmax": minmaxs,
+        }
+
+    def decompress_fast(self, z_strings, y_strings, minmaxs, z_shape):
+        cdf_chunk = int(os.environ.get("FTIC_CDF_CHUNK", "8192"))
+
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z_shape)
+        latent_scales = self.h_scale_s(z_hat)
+        latent_means = self.h_mean_s(z_hat)
+        hyper = torch.cat((latent_means, latent_scales), dim=1)
+
+        y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
+        y_hat_coded = torch.zeros((1, self.M, y_shape[0], y_shape[1])).to(z_hat.device)
+        lrp_coded = torch.zeros_like(y_hat_coded)
+        channel_per_slices = self.M // self.num_slices
+        for slice_index in range(self.num_slices):
+            means, scales, lrps = self.tca(hyper, y_hat_coded)
+            mu = means[:, slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices]
+            scale = scales[:, slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices]
+            lrp = lrps[:, slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices]
+
+            slice_minmax = int(minmaxs[slice_index])
+            cdfs = _build_cdf_gpu(mu, scale, slice_minmax, chunk=cdf_chunk)
+            cdfs_cpu = cdfs.to(dtype=torch.int32, device="cpu").contiguous()
+            symbols = ans.decode_with_cdfs_tensor(y_strings[slice_index], cdfs_cpu)
+            y_hat_slice = symbols.to(z_hat.device).view(
+                1, channel_per_slices, y_shape[0], y_shape[1]
+            )
+            y_hat_slice = y_hat_slice - slice_minmax
+            y_hat_coded[
+                :,
+                slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices,
+            ] = y_hat_slice
+
+            lrp_coded[
+                :,
+                slice_index * channel_per_slices : (slice_index + 1) * channel_per_slices,
+            ] = lrp
+
+        lrp_coded = 0.5 * torch.tanh(lrp_coded)
+        y_hat = y_hat_coded + lrp_coded
+        x_hat = self.g_s(y_hat).clamp_(0, 1)
         return {"x_hat": x_hat}

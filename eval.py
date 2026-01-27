@@ -3,13 +3,11 @@ import torch.nn.functional as F
 from torchvision import transforms
 from models import FrequencyAwareTransFormer
 import warnings
-import torch
 import os
 import sys
 import math
 import argparse
 import time
-import warnings
 from pytorch_msssim import ms_ssim
 from PIL import Image
 warnings.filterwarnings("ignore")
@@ -60,6 +58,11 @@ def parse_args(argv):
     parser.add_argument(
         "--real", action="store_true", default=True
     )
+    parser.add_argument(
+        "--fast", action="store_true", default=False,
+        help="Use compress_fast/decompress_fast for real compression",
+    )
+    parser.set_defaults(fast=True)
     parser.set_defaults(real=False)
     args = parser.parse_args(argv)
     return args
@@ -91,9 +94,13 @@ def main(argv):
         checkpoint = torch.load(args.checkpoint, map_location=device)
         for k, v in checkpoint.items():
             dictory[k.replace("module.", "")] = v
-        net.load_state_dict(dictory,strict=True)
+        net.load_state_dict(dictory, strict=False)
     if args.real:
         net.update()
+        gc_device = torch.device(device)
+        net.gaussian_conditional = net.gaussian_conditional.cpu()
+        net.gaussian_conditional.update(force=True)
+        net.gaussian_conditional = net.gaussian_conditional.to(gc_device)
         for img_name in img_list:
             img_path = os.path.join(path, img_name)
             img = transforms.ToTensor()(Image.open(img_path).convert('RGB')).to(device)
@@ -104,19 +111,32 @@ def main(argv):
                 if args.cuda:
                     torch.cuda.synchronize()
                 s = time.time()
-                output_path = './y_output.bin'
-                out_enc = net.compress(x_padded,output_path)
-                out_dec = net.decompress(out_enc["z_strings"], out_enc["minmax"],out_enc["z_shape"],output_path)
+                if args.fast:
+                    out_enc = net.compress_fast(x_padded)
+                    out_dec = net.decompress_fast(
+                        out_enc["z_strings"],
+                        out_enc["y_strings"],
+                        out_enc["minmax"],
+                        out_enc["z_shape"],
+                    )
+                else:
+                    out_enc = net.compress(x_padded, "./y_output.bin")
+                    out_dec = net.decompress(out_enc["z_strings"], out_enc["y_strings"], out_enc["z_shape"])
                 if args.cuda:
                     torch.cuda.synchronize()
                 e = time.time()
                 total_time += (e - s)
                 out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
                 num_pixels = x.size(0) * x.size(2) * x.size(3)
-                print(f'Bitrate: {((len(out_enc["z_strings"][0])+out_enc["y_size"]) * 8.0 / num_pixels):.3f}bpp')
-                print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
-                print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
-                Bit_rate += (len(out_enc["z_strings"][0])+out_enc["y_size"])  * 8.0 / num_pixels
+                if args.fast:
+                    y_bytes = sum(len(s) for s in out_enc["y_strings"])
+                else:
+                    y_bytes = sum(len(s[0]) for s in out_enc["y_strings"])
+                z_bytes = len(out_enc["z_strings"][0])
+                print(f'Bitrate: {((z_bytes + y_bytes) * 8.0 / num_pixels):.3f}bpp')
+                print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.3f}dB')
+                print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.3f}dB')
+                Bit_rate += (z_bytes + y_bytes) * 8.0 / num_pixels
                 PSNR += compute_psnr(x, out_dec["x_hat"])
                 MS_SSIM += compute_msssim(x, out_dec["x_hat"])
 
@@ -138,8 +158,8 @@ def main(argv):
                 total_time += (e - s)
                 out_net['x_hat'].clamp_(0, 1)
                 out_net["x_hat"] = crop(out_net["x_hat"], padding)
-                print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
-                print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
+                print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.3f}dB')
+                print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.3f}dB')
                 print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
                 PSNR += compute_psnr(x, out_net["x_hat"])
                 MS_SSIM += compute_msssim(x, out_net["x_hat"])
@@ -148,10 +168,10 @@ def main(argv):
     MS_SSIM = MS_SSIM / count
     Bit_rate = Bit_rate / count
     total_time = total_time / count
-    print(f'average_PSNR: {PSNR:.2f}dB')
+    print(f'average_PSNR: {PSNR:.3f}dB')
     print(f'average_MS-SSIM: {MS_SSIM:.4f}')
     print(f'average_Bit-rate: {Bit_rate:.3f} bpp')
-    print(f'average_time: {total_time:.3f} ms')
+    print(f'average_time: {total_time:.3f} s')
     
 
 if __name__ == "__main__":
