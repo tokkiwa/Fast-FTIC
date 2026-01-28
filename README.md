@@ -5,8 +5,8 @@ inefficient per-pixel cdf computation. This implementation uses rANS and batch c
 
 # Exactness
 
-This implementation is fully compatible with original weights. 
-The speed is much faster (less than 1s/img) than the original one while performance is a bit lower (approx. +0.001 bpp) due to the approximation in rANS.
+You can load original weights for this implementation. 
+The speed is much faster (less than 1s/img) than the original one while performance is a bit lower (approx. +0.001 bpp) due to the entropy coder differences.
 
 The RD curve is below:
 
